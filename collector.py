@@ -210,14 +210,33 @@ class Collector:
                             s.title = " ".join(c.split())[:48]
 
     # ------------------------------------------------------------------ Codex
+    def codex_threads(self):
+        """Recently-updated threads from Codex's own index. Resumed threads keep appending
+        to their original rollout file (possibly weeks old), so date folders alone miss them."""
+        db = os.path.join(HOME, ".codex", "state_5.sqlite")
+        if not os.path.exists(db):
+            return {}
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+            rows = con.execute(
+                "select rollout_path, cwd, coalesce(nullif(name,''), nullif(title,''), first_user_message), "
+                "agent_nickname, thread_source from threads where updated_at >= ? and rollout_path is not null",
+                (self.day - 3600,)).fetchall()
+            con.close()
+        except Exception:
+            return {}
+        return {r[0]: r[1:] for r in rows}
+
     def scan_codex(self):
         now = dt.datetime.now()
-        dirs = set()
+        paths = {}
         for back in range(0, 3):
             day = now - dt.timedelta(days=back)
-            dirs.add(os.path.join(HOME, ".codex", "sessions", f"{day:%Y}", f"{day:%m}", f"{day:%d}"))
-        for d_ in dirs:
+            d_ = os.path.join(HOME, ".codex", "sessions", f"{day:%Y}", f"{day:%m}", f"{day:%d}")
             for p in glob.glob(os.path.join(d_, "*.jsonl")):
+                paths[p] = None
+        paths.update(self.codex_threads())
+        for p, meta in paths.items():
                 try:
                     mt = os.path.getmtime(p)
                 except OSError:
@@ -226,6 +245,14 @@ class Collector:
                     continue
                 key = "codex:" + os.path.basename(p)[:-6]
                 s = self.sess(key, "codex")
+                if meta:
+                    cwd, title, nick, source = meta
+                    if cwd and not s.cwd:
+                        s.cwd, s.project = cwd, project_name(cwd)
+                    if not s.title and (nick or title):
+                        s.title = (nick or " ".join(title.split()))[:48]
+                    if source == "subagent":
+                        s.sub = True
                 for raw in self.tail(p).read():
                     try:
                         d = json.loads(raw)
@@ -407,7 +434,9 @@ class Collector:
         for key, s in self.sessions.items():
             age = now - s.last if s.last else 1e9
             if age > IDLE_KEEP:
-                if age > 6 * 3600:
+                # only forget sessions we aren't tailing; a tailed file can resume later and
+                # its header (cwd, parent) has already been consumed
+                if age > 6 * 3600 and not s.harness in ("claude", "codex"):
                     dead.append(key)
                 continue
             state = s.state
