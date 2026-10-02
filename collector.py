@@ -58,8 +58,19 @@ def project_name(cwd):
     return parts[-1]
 
 
+# Title sources, weakest to strongest. A session keeps the strongest title seen so far.
+TITLE_PROMPT, TITLE_AUTO, TITLE_APP, TITLE_USER = 0, 1, 2, 3
+
+
+def set_title(s, title, rank):
+    if title and rank >= s.trank:
+        title = " ".join(str(title).split())
+        if title:
+            s.title, s.trank = title[:60], rank
+
+
 class Session:
-    __slots__ = ("id", "harness", "cwd", "project", "parent", "title", "state",
+    __slots__ = ("id", "harness", "cwd", "project", "parent", "title", "trank", "state",
                  "last", "tokens", "sub", "started")
 
     def __init__(self, sid, harness):
@@ -69,6 +80,7 @@ class Session:
         self.project = "unknown"
         self.parent = None
         self.title = None
+        self.trank = -1             # title source rank, see TITLE_*
         self.state = "idle"
         self.last = 0.0
         self.tokens = 0
@@ -115,6 +127,9 @@ class Collector:
         self.claude_msgs = {}       # message id -> counted tokens (dedupe streaming rows)
         self.hermes_base = {}       # session id -> tokens counted at first sight today
         self.snapshot = {}
+        self.app_titles = {}        # claude cli session id -> (title, rank)
+        self.app_cwds = {}          # claude cli session id -> project folder the app opened
+        self.app_title_files = {}   # path -> (mtime, cli id, title, rank)
 
     # ---------------------------------------------------------------- helpers
     def add_tokens(self, harness, n, ts, sess=None, rate=True):
@@ -139,7 +154,35 @@ class Collector:
         return t
 
     # ------------------------------------------------------------ Claude Code
+    def load_claude_app_titles(self):
+        """Session names from the Claude desktop app, which keeps them outside the transcript."""
+        base = os.path.join(HOME, "Library", "Application Support", "Claude")
+        seen = set()
+        for sub in ("claude-code-sessions", "local-agent-mode-sessions"):
+            for f in glob.glob(os.path.join(base, sub, "*", "*", "local_*.json")):
+                seen.add(f)
+                try:
+                    mt = os.path.getmtime(f)
+                except OSError:
+                    continue
+                old = self.app_title_files.get(f)
+                if old and old[0] == mt:
+                    continue
+                try:
+                    with open(f) as fh:
+                        d = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                rank = TITLE_USER if d.get("titleSource") == "user" else TITLE_APP
+                self.app_title_files[f] = (mt, d.get("cliSessionId"), d.get("title"), rank, d.get("cwd"))
+        for f in list(self.app_title_files):
+            if f not in seen:
+                del self.app_title_files[f]
+        self.app_titles = {cid: (t, r) for _, cid, t, r, _ in self.app_title_files.values() if cid and t}
+        self.app_cwds = {cid: c for _, cid, _, _, c in self.app_title_files.values() if cid and c}
+
     def scan_claude(self):
+        self.load_claude_app_titles()
         root = os.path.join(HOME, ".claude", "projects")
         paths = glob.glob(os.path.join(root, "*", "*.jsonl")) + \
             glob.glob(os.path.join(root, "*", "*", "subagents", "*.jsonl"))
@@ -154,13 +197,15 @@ class Collector:
             sid = os.path.basename(p)[:-6]
             key = "claude:" + sid
             s = self.sess(key, "claude")
+            if sid in self.app_titles:
+                set_title(s, *self.app_titles[sid])
             if sub:
                 s.sub = True
                 s.parent = "claude:" + os.path.basename(os.path.dirname(os.path.dirname(p)))
-                if not s.title:
+                if s.trank < TITLE_AUTO:
                     try:
                         with open(p[:-6] + ".meta.json") as mf:
-                            s.title = (json.load(mf).get("description") or "")[:60] or None
+                            set_title(s, json.load(mf).get("description"), TITLE_AUTO)
                     except (OSError, ValueError):
                         pass
             for raw in self.tail(p).read():
@@ -170,15 +215,18 @@ class Collector:
                     continue
                 ts = iso_ts(d.get("timestamp", "")) or mt
                 if d.get("cwd") and not s.cwd:
+                    # the desktop app runs some sessions from a scratch dir; it records the real folder
                     s.cwd = d["cwd"]
+                    if "/scratch-workspaces/" in s.cwd and sid in self.app_cwds:
+                        s.cwd = self.app_cwds[sid]
                     s.project = project_name(s.cwd)
                 t = d.get("type")
-                if t == "custom-title" and d.get("customTitle"):
-                    s.title = d["customTitle"][:60]
-                elif t == "agent-name" and d.get("agentName") and not s.title:
-                    s.title = d["agentName"][:60]
-                elif t == "summary" and d.get("summary") and not s.title:
-                    s.title = d["summary"][:60]
+                if t == "custom-title":
+                    set_title(s, d.get("customTitle"), TITLE_USER)
+                elif t == "agent-name":
+                    set_title(s, d.get("agentName"), TITLE_AUTO)
+                elif t == "summary":
+                    set_title(s, d.get("summary"), TITLE_AUTO)
                 if t not in ("assistant", "user"):
                     continue
                 s.last = max(s.last, ts)
@@ -202,12 +250,12 @@ class Collector:
                         s.state = "working"
                 else:
                     s.state = "working"
-                    if not s.title and not d.get("isMeta"):
+                    if s.trank < TITLE_PROMPT and not d.get("isMeta"):
                         c = msg.get("content")
                         if isinstance(c, list):
                             c = next((b.get("text") for b in c if isinstance(b, dict) and b.get("type") == "text"), None)
                         if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
-                            s.title = " ".join(c.split())[:48]
+                            set_title(s, c[:200], TITLE_PROMPT)
 
     # ------------------------------------------------------------------ Codex
     def codex_threads(self):
@@ -219,7 +267,7 @@ class Collector:
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
             rows = con.execute(
-                "select rollout_path, cwd, coalesce(nullif(name,''), nullif(title,''), first_user_message), "
+                "select rollout_path, cwd, name, coalesce(nullif(title,''), first_user_message), "
                 "agent_nickname, thread_source from threads where updated_at >= ? and rollout_path is not null",
                 (self.day - 3600,)).fetchall()
             con.close()
@@ -246,11 +294,12 @@ class Collector:
                 key = "codex:" + os.path.basename(p)[:-6]
                 s = self.sess(key, "codex")
                 if meta:
-                    cwd, title, nick, source = meta
+                    cwd, name, title, nick, source = meta
                     if cwd and not s.cwd:
                         s.cwd, s.project = cwd, project_name(cwd)
-                    if not s.title and (nick or title):
-                        s.title = (nick or " ".join(title.split()))[:48]
+                    set_title(s, name, TITLE_USER)      # renamed in the Codex app
+                    set_title(s, nick, TITLE_AUTO)
+                    set_title(s, (title or "")[:200], TITLE_PROMPT)
                     if source == "subagent":
                         s.sub = True
                 for raw in self.tail(p).read():
@@ -266,7 +315,7 @@ class Collector:
                         s.project = project_name(s.cwd)
                         if pl.get("thread_source") == "subagent":
                             s.sub = True
-                            s.title = pl.get("agent_nickname")
+                            set_title(s, pl.get("agent_nickname"), TITLE_AUTO)
                             par = pl.get("parent_thread_id")
                             if par:
                                 s.parent = "codex-thread:" + par
@@ -307,7 +356,7 @@ class Collector:
             s = self.sess(key, "hermes")
             s.cwd = cwd
             s.project = project_name(cwd) if cwd else (source or "hermes")
-            s.title = title
+            set_title(s, title, TITLE_APP)
             s.last = last or started
             if parent:
                 s.sub, s.parent = True, "hermes:" + parent
@@ -429,19 +478,35 @@ class Collector:
 
         # alias codex sessions by thread id so subagent parents resolve
         alias = {s.id: k for k, s in self.sessions.items() if s.harness == "codex"}
+
+        def live_state(s):
+            age = now - s.last if s.last else 1e9
+            if age > IDLE_KEEP:
+                return None
+            return "idle" if s.state == "working" and age > WORKING_STALE else s.state
+
+        # a lead session waiting on its subagents writes nothing, so it would age out while
+        # they run; keep it on the skyline (and lit) as long as any child is alive
+        child_states = {}
+        for s in self.sessions.values():
+            if s.sub and s.parent:
+                st = live_state(s)
+                if st:
+                    p = alias.get(s.parent, s.parent)
+                    child_states.setdefault(p, set()).add(st)
         agents = []
         dead = []
         for key, s in self.sessions.items():
             age = now - s.last if s.last else 1e9
-            if age > IDLE_KEEP:
+            if age > IDLE_KEEP and key not in child_states:
                 # only forget sessions we aren't tailing; a tailed file can resume later and
                 # its header (cwd, parent) has already been consumed
                 if age > 6 * 3600 and not s.harness in ("claude", "codex"):
                     dead.append(key)
                 continue
-            state = s.state
-            if state == "working" and age > WORKING_STALE:
-                state = "idle"
+            state = live_state(s) or "idle"
+            if "working" in child_states.get(key, ()):
+                state = "working"
             parent = alias.get(s.parent, s.parent) if s.parent else None
             agents.append({
                 "id": key, "harness": s.harness, "project": s.project, "cwd": s.cwd,

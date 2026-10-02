@@ -398,7 +398,8 @@ function drawTag(L, color, top, mid, bot, state) {
   ctx.strokeStyle = color; ctx.globalAlpha = 0.7; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(W / 2, y0 + bh); ctx.lineTo(W / 2, H); ctx.stroke(); ctx.globalAlpha = 1;
   ctx.font = '600 25px "SF Mono", Menlo, monospace'; ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 10;
-  ctx.fillText(top, x0 + 20, y0 + 36);
+  let tp = top; while (ctx.measureText(tp).width > bw - 70 && tp.length > 4) tp = tp.slice(0, -2);
+  ctx.fillText(tp === top ? top : tp + '…', x0 + 20, y0 + 36);
   ctx.shadowBlur = 0;
   ctx.fillStyle = state === 'working' ? color : '#6d6a88';
   ctx.beginPath(); ctx.arc(x0 + bw - 26, y0 + 27, 7, 0, 7); ctx.fill();
@@ -485,10 +486,12 @@ class Tower {
     this.hTarget = this.sub ? Math.min(30, 7 + 5 * Math.log10(1 + t / 8000)) : Math.min(78, 22 + 14 * Math.log10(1 + t / 20000));
     this.working = agent.state === 'working';
     if (this.label) {
+      // session name as the headline; the project folder rides in the header
       const vague = !agent.project || agent.project === 'unknown' || agent.project === '~';
-      const title = vague ? (agent.title || agent.project) : agent.project;
+      const top = vague || agent.title === agent.project ? this.hname : `${this.hname} · ${agent.project}`;
+      const title = agent.title || (vague ? null : agent.project);
       const nsub = [...towers.values()].filter(o => o.parent === this && o.alive).length;
-      drawTag(this.label, this.hex, this.hname, title || '—', `${fmt(t)} tok${nsub ? ` · ${nsub} sub` : ''}${this.working ? '' : ' · idle'}`, agent.state);
+      drawTag(this.label, this.hex, top, title || '—', `${fmt(t)} tok${nsub ? ` · ${nsub} sub` : ''}${this.working ? '' : ' · idle'}`, agent.state);
     }
   }
   kill() { this.alive = false; }
