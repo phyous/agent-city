@@ -33,9 +33,10 @@ const HARNESS = {
   crush:    { name: 'CRUSH',       color: '#ff66aa', d: 9 },
 };
 const harness = (h) => HARNESS[h] || { name: h.toUpperCase(), color: '#ffffff', d: 9 };
-// district bearings (degrees) relative to the camera's line of sight; 0 = nearest the viewer
-const DISTRICT_BEARING = [-38, 38, 118, -118, 180, 150, -150, 78, -78, 0];
-const ND = DISTRICT_BEARING.length;
+// The city is split into one pie-slice district per installed harness (collector's
+// `installed`); one harness owns the whole city. ND caps the slices.
+const ND = 10;
+const DISTRICTS_OVERRIDE = Q.get('districts')?.split(',').filter(Boolean);
 
 // ------------------------------------------------------------------ renderer
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
@@ -91,7 +92,7 @@ const U = {
   uGlobal: { value: 0.03 },
   uLevels: { value: new Array(ND + 1).fill(0.03) },
   uColors: { value: Array.from({ length: ND + 1 }, () => new THREE.Color('#ff3df2')) },
-  uDistPos: { value: Array.from({ length: ND }, () => new THREE.Vector2()) },
+  uDistPos: { value: Array.from({ length: ND }, () => new THREE.Vector2(1e5, 1e5)) },
   ...fogUniforms,
 };
 
@@ -100,25 +101,12 @@ const P = 8, ROAD = 2.0, HB = 19;          // block pitch, road width, half-exte
 const rng = mulberry32(1337);
 function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 
-const districts = DISTRICT_BEARING.map((deg, i) => {
-  const a = CAM.yaw + deg * Math.PI / 180;
-  const R = 6.2 * P;
-  const bx = Math.round(Math.sin(a) * R / P), bz = Math.round(Math.cos(a) * R / P);
-  const slots = [];
-  for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) {
-    const x = bx + dx, z = bz + dz;
-    if (Math.abs(x) <= 1 && Math.abs(z) <= 1) continue;
-    slots.push({ bx: x, bz: z, d: Math.hypot(dx, dz) + rng() * 0.01, owner: null });
-  }
-  slots.sort((a, b) => a.d - b.d);
-  U.uDistPos.value[i].set(bx * P, bz * P);
-  return { i, bx, bz, x: bx * P, z: bz * P, slots, level: 0.03, color: new THREE.Color('#ff3df2') };
-});
-// a block can only belong to one district's slot list
-{
-  const seen = new Set();
-  for (const d of districts) d.slots = d.slots.filter(s => { const k = s.bx + ',' + s.bz; if (seen.has(k)) return false; seen.add(k); return true; });
-}
+let districts = [];
+let districtOrder = [];
+const dIdx = (h) => Math.max(0, districtOrder.indexOf(h));
+const wrapDeg = (a) => ((a + 540) % 360) - 180;
+// bearing (degrees) of a ground point relative to the camera's line of sight; 0 = nearest the viewer
+const bearingOf = (x, z) => wrapDeg((Math.atan2(x, z) - CAM.yaw) * 180 / Math.PI);
 
 // ------------------------------------------------------------------ generic buildings
 const BUILDING_VERT = `
@@ -239,7 +227,6 @@ const HIGHWAYS = [
 ];
 const hwDist = (x, z, hw) => Math.abs((x - hw.o.x) * -hw.d.y + (z - hw.o.y) * hw.d.x);
 const inCorridor = (x, z, pad = 0) => HIGHWAYS.some(hw => hwDist(x, z, hw) < 2.6 + pad);
-for (const d of districts) d.slots = d.slots.filter(s => !inCorridor(s.bx * P, s.bz * P, 4.5));
 const buildings = [];      // {x,z,w,d,h,y0,block}
 const blockIdx = new Map(); // "bx,bz" -> [building indices]
 const coreBlocks = (x, z) => Math.abs(x) <= 1 && Math.abs(z) <= 1;
@@ -256,7 +243,6 @@ for (let bx = -HB; bx <= HB; bx++) for (let bz = -HB; bz <= HB; bz++) {
   const cx = bx * P, cz = bz * P, inner = P - ROAD;
   const dist = Math.hypot(cx, cz);
   let bump = 1 + 1.5 * Math.exp(-((dist / 62) ** 2));
-  for (const d of districts) bump += 0.6 * Math.exp(-(((cx - d.x) ** 2 + (cz - d.z) ** 2) / (24 * 24)));
   const n = rng() < 0.16 ? 1 : rng() < 0.55 ? 2 : 3;
   const lot = inner / n;
   for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
@@ -276,16 +262,7 @@ for (let bx = -HB; bx <= HB; bx++) for (let bz = -HB; bz <= HB; bz++) {
 }
 const NB = buildings.length;
 const aSeed = new Float32Array(NB), aDistrict = new Float32Array(NB), aInfl = new Float32Array(NB);
-buildings.forEach((b, i) => {
-  aSeed[i] = rng();
-  let best = 0, bi = -1;
-  districts.forEach((d, k) => {
-    const w = Math.exp(-(((b.x - d.x) ** 2 + (b.z - d.z) ** 2) / (30 * 30)));
-    if (w > best) { best = w; bi = k; }
-  });
-  aDistrict[i] = best > 0.04 ? bi + 1 : 0;
-  aInfl[i] = best > 0.04 ? best : 0;
-});
+buildings.forEach((b, i) => { aSeed[i] = rng(); });
 genericGeo.setAttribute('aSeed', new THREE.InstancedBufferAttribute(aSeed, 1));
 genericGeo.setAttribute('aDistrict', new THREE.InstancedBufferAttribute(aDistrict, 1));
 genericGeo.setAttribute('aInfl', new THREE.InstancedBufferAttribute(aInfl, 1));
@@ -299,6 +276,53 @@ function writeBuilding(i, k = 1) {
 }
 for (let i = 0; i < NB; i++) writeBuilding(i);
 scene.add(city);
+
+// Split the city into equal slices, one per harness. Slice k is centred on bearing
+// centre(k); with an even count a boundary runs down the line of sight so both
+// front slices face the camera.
+function layoutDistricts(order) {
+  order = order.slice(0, ND);
+  if (!order.length) order = ['claude'];
+  districtOrder = order;
+  const N = order.length, half = 180 / N;
+  const centre = (k) => wrapDeg((N % 2 ? 0 : half) + k * 360 / N);
+  const sliceOf = (x, z) => {
+    const b = bearingOf(x, z);
+    let best = 0, bd = 1e9;
+    for (let k = 0; k < N; k++) { const d = Math.abs(wrapDeg(b - centre(k))); if (d < bd) { bd = d; best = k; } }
+    return { k: best, edge: N > 1 ? (half - bd) * Math.PI / 180 * Math.hypot(x, z) : 1e9 };
+  };
+  const R = 6.2 * P;
+  districts = order.map((h, k) => {
+    const a = CAM.yaw + centre(k) * Math.PI / 180;
+    const x = Math.sin(a) * R, z = Math.cos(a) * R;
+    const slots = [];
+    for (let bx = -HB + 2; bx <= HB - 2; bx++) for (let bz = -HB + 2; bz <= HB - 2; bz++) {
+      if (Math.abs(bx) <= 1 && Math.abs(bz) <= 1) continue;
+      if (inCorridor(bx * P, bz * P, 4.5)) continue;
+      const sl = sliceOf(bx * P, bz * P);
+      if (sl.k !== k || sl.edge < P * 0.9) continue;      // keep towers off the border
+      slots.push({ bx, bz, d: Math.hypot(bx * P - x, bz * P - z) + rng() * 0.01, owner: null });
+    }
+    slots.sort((p, q) => p.d - q.d);
+    slots.length = Math.min(slots.length, 48);
+    return { i: k, h, x, z, slots, level: 0.03, color: new THREE.Color(harness(h).color) };
+  });
+  for (let k = 0; k < ND; k++) {
+    U.uDistPos.value[k].set(k < N ? districts[k].x : 1e5, k < N ? districts[k].z : 1e5);
+    U.uLevels.value[k + 1] = 0.03;
+  }
+  // every building belongs to a slice; it glows fully inside and fades near the borders
+  // and towards the outskirts
+  buildings.forEach((b, i) => {
+    const sl = sliceOf(b.x, b.z), d = districts[sl.k];
+    aDistrict[i] = sl.k + 1;
+    const edge = Math.min(1, Math.max(0, sl.edge / 10));
+    aInfl[i] = edge * (0.45 + 0.55 * Math.exp(-(((b.x - d.x) ** 2 + (b.z - d.z) ** 2) / (58 * 58))));
+  });
+  genericGeo.attributes.aDistrict.needsUpdate = true;
+  genericGeo.attributes.aInfl.needsUpdate = true;
+}
 
 function setBlockSuppressed(bx, bz, on) {
   const key = bx + ',' + bz;
@@ -838,10 +862,21 @@ function claimSlot(d, id) {
 function releaseSlot(slot) {
   if (!slot) return;
   slot.owner = null;
-  setTimeout(() => { if (!slot.owner) setBlockSuppressed(slot.bx, slot.bz, false); }, 2500);
+  setTimeout(() => {
+    const taken = districts.some(d => d.slots.some(q => q.owner && q.bx === slot.bx && q.bz === slot.bz));
+    if (!slot.owner && !taken) setBlockSuppressed(slot.bx, slot.bz, false);
+  }, 2500);
 }
 
 function applyState() {
+  const order = DISTRICTS_OVERRIDE || state.installed
+    || [...new Set(['claude', ...Object.keys(state.harnesses || {})])];
+  if (order.join() !== districtOrder.join() || !districts.length) {
+    // new harness layout: clear the skyline and rebuild every tower in its new slice
+    for (const t of towers.values()) { releaseSlot(t.slot); t.dispose(); }
+    towers.clear();
+    layoutDistricts(order);
+  }
   const seen = new Set();
   const byId = new Map(state.agents.map(a => [a.id, a]));
   // parents first so subagents can attach
@@ -861,7 +896,7 @@ function applyState() {
       t.subIdx = k;
     } else {
       if (byId.has(a.parent) && !parent) continue; // parent not built yet; next poll
-      const d = districts[harness(a.harness).d];
+      const d = districts[dIdx(a.harness)];
       const slot = claimSlot(d, a.id);
       if (!slot) continue;
       t = new Tower(a, slot.bx * P, slot.bz * P, false, null, slot);
@@ -875,7 +910,7 @@ function applyState() {
   const lv = new Array(ND).fill(0.03);
   const col = new Array(ND).fill(null);
   for (const [h, info] of Object.entries(state.harnesses || {})) {
-    const H = harness(h), d = H.d;
+    const H = harness(h), d = dIdx(h);
     const v = info.working > 0 ? Math.min(1, 0.55 + 0.1 * info.working + 0.2 * Math.min(1, info.tpm / 150000))
       : info.idle > 0 ? 0.18 : info.tokensToday > 0 ? 0.07 : 0.03;
     if (v >= lv[d]) { lv[d] = v; col[d] = H.color; }
@@ -895,8 +930,9 @@ function updateHud() {
   $('agents-s').textContent = s.working ? `${main} lead${main === 1 ? '' : 's'}${s.subagents ? ` · ${s.subagents} sub` : ''}${s.idle ? ` · ${s.idle} idle` : ''}` : s.idle ? `${s.idle} idle` : 'city asleep';
   $('tokens-s').textContent = s.tpm > 0 ? `${fmt(s.tpm)} / min` : '';
   const chips = $('chips');
-  const hs = Object.entries(s.harnesses || {}).filter(([, v]) => v.working || v.idle || v.tokensToday)
-    .sort((a, b) => harness(a[0]).d - harness(b[0]).d);
+  const blank = { working: 0, idle: 0, tokensToday: 0 };
+  const hs = [...new Set([...districtOrder, ...Object.keys(s.harnesses || {})])]
+    .map(h => [h, s.harnesses?.[h] || blank]).filter(([h, v]) => districtOrder.includes(h) || v.working || v.idle || v.tokensToday);
   chips.innerHTML = hs.map(([h, v]) => {
     const H = harness(h);
     const n = v.working ? `<b>${v.working}</b>▲` : v.idle ? `${v.idle} idle` : '';
@@ -936,7 +972,7 @@ function demoState(now) {
   hs.claude ??= { working: 0, idle: 0, subagents: 0, tokensToday: 0, tpm: 0 };
   hs.claude.tokensToday = Math.round(demo.tokens * 0.86);
   const projects = [...new Set(agents.filter(a => a.state === 'working' && !a.sub).map(a => a.project))];
-  return { agents, harnesses: hs, projects, working, idle: agents.length - working, subagents: sub, tokensToday: Math.round(demo.tokens), tpm };
+  return { installed: ['claude', 'codex', 'hermes', 'gemini', 'pi'], agents, harnesses: hs, projects, working, idle: agents.length - working, subagents: sub, tokensToday: Math.round(demo.tokens), tpm };
 }
 
 // ------------------------------------------------------------------ main loop

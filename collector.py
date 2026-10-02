@@ -69,6 +69,57 @@ def set_title(s, title, rank):
             s.title, s.trank = title[:60], rank
 
 
+# Harness detection: a harness gets a district when it is installed (a binary on the usual
+# bin paths, or its app) and was used in the last INSTALLED_RECENT days. Harnesses with live
+# sessions always count. Listed in district order: the first sits nearest the camera.
+INSTALLED_RECENT = 30 * 86400
+HARNESS_PROBES = [
+    # name, binaries, app paths, globs whose mtimes show use (None: installed is enough)
+    ("claude", ["claude"], ["/Applications/Claude.app"], [".claude/projects/*"]),
+    ("codex", ["codex"], ["/Applications/Codex.app", "/Applications/ChatGPT.app/Contents/Resources/codex-cli"],
+     [".codex/sessions/*/*/*"]),
+    ("hermes", ["hermes"], [], [".hermes/state.db"]),
+    ("gemini", ["gemini"], [], [".gemini/tmp/*/chats"]),
+    ("copilot", ["copilot"], [], [".copilot/session-state/*"]),
+    ("pi", ["pi"], [], [".pi/agent/sessions/*"]),
+    ("opencode", ["opencode"], [], [".local/share/opencode/storage/session/*"]),
+    ("cursor", ["cursor-agent"], [], None),
+    ("aider", ["aider"], [], None),
+    ("amp", ["amp"], [], None),
+    ("droid", ["droid"], [], None),
+    ("goose", ["goose"], [], None),
+    ("crush", ["crush"], [], None),
+]
+BIN_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "~/.local/bin", "~/.bun/bin", "~/.npm-global/bin",
+            "~/.cargo/bin", "~/.volta/bin", "~/bin"]
+
+
+def detect_installed():
+    dirs = [os.path.expanduser(d) for d in BIN_DIRS + os.environ.get("PATH", "").split(":") if d]
+    cutoff = time.time() - INSTALLED_RECENT
+    found = []
+    for name, bins, apps, usage in HARNESS_PROBES:
+        if not (any(os.access(os.path.join(d, b), os.X_OK) for d in dirs for b in bins)
+                or any(os.path.exists(a) for a in apps)):
+            continue
+        if usage is not None:
+            recent = False
+            for g in usage:
+                for p in glob.glob(os.path.join(HOME, g)):
+                    try:
+                        if os.path.getmtime(p) >= cutoff:
+                            recent = True
+                            break
+                    except OSError:
+                        pass
+                if recent:
+                    break
+            if not recent:
+                continue
+        found.append(name)
+    return found
+
+
 class Session:
     __slots__ = ("id", "harness", "cwd", "project", "parent", "title", "trank", "state",
                  "last", "tokens", "sub", "started")
@@ -127,6 +178,8 @@ class Collector:
         self.claude_msgs = {}       # message id -> counted tokens (dedupe streaming rows)
         self.hermes_base = {}       # session id -> tokens counted at first sight today
         self.snapshot = {}
+        self.installed = []
+        self.installed_at = 0.0
         self.app_titles = {}        # claude cli session id -> (title, rank)
         self.app_cwds = {}          # claude cli session id -> project folder the app opened
         self.app_title_files = {}   # path -> (mtime, cli id, title, rank)
@@ -533,8 +586,14 @@ class Collector:
                 "tokensToday": self.tokens_today.get(h, 0),
                 "tpm": rate.get(h, 0),
             }
+        if now - self.installed_at > 300:
+            self.installed, self.installed_at = detect_installed(), now
+        order = [h for h, *_ in HARNESS_PROBES]
+        live = {a["harness"] for a in agents}
+        installed = sorted(set(self.installed) | live, key=lambda h: order.index(h) if h in order else 99)
         snap = {
             "t": now,
+            "installed": installed,
             "agents": agents,
             "harnesses": harnesses,
             "projects": sorted({a["project"] for a in working}),
