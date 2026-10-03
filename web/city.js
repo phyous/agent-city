@@ -59,10 +59,10 @@ const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 const finalPass = new ShaderPass({
-  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uAb: { value: 0.0035 }, uRes: { value: new THREE.Vector2() } },
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uAb: { value: 0.0035 }, uRes: { value: new THREE.Vector2() }, uGrain: { value: Q.get('grain') === '0' ? 0 : 1 } },
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
   fragmentShader: `
-    uniform sampler2D tDiffuse; uniform float uTime; uniform float uAb; uniform vec2 uRes; varying vec2 vUv;
+    uniform sampler2D tDiffuse; uniform float uTime; uniform float uAb; uniform vec2 uRes; uniform float uGrain; varying vec2 vUv;
     float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
     void main(){
       vec2 d = vUv - 0.5;
@@ -73,7 +73,7 @@ const finalPass = new ShaderPass({
       c.b = texture2D(tDiffuse, vUv - d * ab).b;
       float vig = smoothstep(0.95, 0.25, length(d * vec2(1.0, 1.25)));
       c *= mix(0.55, 1.0, vig);
-      c += (h(vUv * uRes + fract(uTime) * 91.7) - 0.5) * 0.018;
+      c += (h(vUv * uRes + fract(uTime) * 91.7) - 0.5) * 0.018 * uGrain;   // film grain (grain=0 for recordings)
       c *= 0.985 + 0.015 * sin(vUv.y * uRes.y * 1.2);
       gl_FragColor = vec4(c, 1.0);
     }`,
