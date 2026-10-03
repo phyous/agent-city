@@ -14,6 +14,7 @@ const FPS = +Q.get('fps') || 30;
 const RES = +Q.get('res') || Math.min(devicePixelRatio, 1.25);
 const RAIN = Q.get('rain') !== '0';
 const LABELS = Q.get('labels') !== '0';
+const STILL = Q.get('still') === '1';   // hold the camera (for recordings: drift defeats GIF compression)
 document.documentElement.style.setProperty('--pad', (Q.get('pad') ?? 110) + 'px');
 
 // ------------------------------------------------------------------ harnesses
@@ -1002,9 +1003,10 @@ function frame() {
   bloom.strength = 0.42 + 0.3 * A;
 
   // camera: slow sway + breathing dolly
-  const yaw = CAM.yaw + Math.sin(time * 0.018) * 0.2;
-  const pitch = CAM.pitch + Math.sin(time * 0.013) * 0.035;
-  const r = CAM.r + Math.sin(time * 0.021) * 8;
+  const ct = STILL ? 0 : time;
+  const yaw = CAM.yaw + Math.sin(ct * 0.018) * 0.2;
+  const pitch = CAM.pitch + Math.sin(ct * 0.013) * 0.035;
+  const r = CAM.r + Math.sin(ct * 0.021) * 8;
   camera.position.set(Math.sin(yaw) * Math.cos(pitch) * r, Math.sin(pitch) * r, Math.cos(yaw) * Math.cos(pitch) * r).add(CAM.target);
   camera.lookAt(CAM.target);
 
